@@ -56,6 +56,8 @@
   .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; align-items: center; }
   .hint { font-size: .85rem; color: var(--muted); margin: 6px 0; }
   .note { background: rgba(99,102,241,.08); border: 1px solid rgba(99,102,241,.3); border-radius: 8px; padding: 10px 12px; font-size: .85rem; margin: 8px 0; }
+  .manual { margin-top: 16px; }
+  .manual summary { cursor: pointer; color: var(--muted); font-size: .85rem; }
   .check { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: .85rem; margin-top: 8px; }
   .mic { width: 120px; height: 120px; border-radius: 50%; border: 0; background: var(--accent); color: #fff; font-size: 48px; cursor: pointer; display: block; margin: 16px auto 8px; }
   .mic.listening { background: var(--err); animation: pulse 1.2s infinite; }
@@ -167,6 +169,11 @@
             <img id="ytThumb" alt="">
             <div><strong id="ytTitle"></strong><div class="hint" id="ytAuthor"></div></div>
           </div>
+          <div class="row"><button class="btn" id="ytAuto" type="button">Capture automatically</button></div>
+          <p class="hint">Your server fetches what was said in the video and saves it. Takes a few seconds.</p>
+
+          <details class="manual">
+          <summary>Or paste the transcript yourself</summary>
           <label for="ytTitleInput">Title</label>
           <input id="ytTitleInput" type="text" placeholder="Video title">
 
@@ -185,6 +192,7 @@
           <textarea id="ytText" placeholder="Paste the transcript here…"></textarea>
           <label class="check"><input type="checkbox" id="ytClean" checked> Remove timestamps (0:00, "2 seconds"…)</label>
           <div class="row"><button class="btn" id="ytSave" type="button">Save video</button></div>
+          </details>
         </div>
       </div>
     </div>
@@ -212,15 +220,22 @@
     <!-- URL -->
     <div class="panel" id="panel-url">
       <div class="card">
-        <div class="note">Browsers don't let one website fetch another website's pages (a security rule). So for now: open the article, copy its text, and paste it below. In Level 3 you'll make this automatic.</div>
-        <label for="urlInput">Article link</label>
+        <label for="urlInput" style="margin-top:0">Article link</label>
         <input id="urlInput" type="url" placeholder="https://…" autocomplete="off">
-        <div class="row"><a class="btn ghost hidden" id="urlOpen" target="_blank" rel="noopener noreferrer">Open article ↗</a></div>
+        <div class="row">
+          <button class="btn" id="urlAuto" type="button">Capture automatically</button>
+          <a class="btn ghost hidden" id="urlOpen" target="_blank" rel="noopener noreferrer">Open article ↗</a>
+        </div>
+        <p class="hint">Your server fetches the page and saves its text. Some pages (logins, paywalls, pages built by JavaScript) can't be read this way; paste those yourself.</p>
+
+        <details class="manual">
+        <summary>Or paste the text yourself</summary>
         <label for="urlTitle">Title (optional)</label>
         <input id="urlTitle" type="text" placeholder="Article title">
         <label for="urlText">Article text</label>
         <textarea id="urlText" placeholder="Paste the article text here…"></textarea>
         <div class="row"><button class="btn" id="urlSave" type="button">Save article</button></div>
+        </details>
       </div>
     </div>
 
@@ -577,6 +592,20 @@
     } catch (e) { toast('Could not save: ' + e.message, true); }
   }));
 
+  // ---------- server-side capture (Level 3 edge functions) ----------
+  // Calls capture-url / capture-youtube with your login token. On failure the
+  // function's own explanation is shown instead of a generic HTTP error.
+  async function invokeCapture(name, body) {
+    const { data, error } = await sb.functions.invoke(name, { body });
+    if (error) {
+      let msg = error.message;
+      try { const j = await error.context.json(); if (j && j.error) msg = j.error; } catch (e) { /* not JSON */ }
+      throw new Error(msg);
+    }
+    if (!data || !data.ok) throw new Error((data && data.error) || 'Unknown error');
+    return data;
+  }
+
   // ---------- YOUTUBE ----------
   function extractYouTubeId(input) {
     const s = (input || '').trim();
@@ -630,6 +659,23 @@
     clearTimeout(ytTimer);
     ytTimer = setTimeout(() => { if (extractYouTubeId($('ytUrl').value)) lookupYouTube(); }, 400);
   });
+
+  $('ytAuto').addEventListener('click', () => busy($('ytAuto'), 'Capturing…', async () => {
+    const id = ytVideoId || extractYouTubeId($('ytUrl').value);
+    if (!id) { toast('Paste a YouTube link first.', true); return; }
+    try {
+      const res = await invokeCapture('capture-youtube', { url: 'https://www.youtube.com/watch?v=' + id });
+      $('ytUrl').value = '';
+      $('ytText').value = '';
+      $('ytTitleInput').value = '';
+      $('ytDetails').classList.add('hidden');
+      ytVideoId = null;
+      toast(res.has_transcript
+        ? 'Video saved ✓ (' + res.chars.toLocaleString() + ' characters of transcript)'
+        : 'Saved, but only the description: no transcript was available.', !res.has_transcript);
+      loadRecent();
+    } catch (e) { toast('Could not capture: ' + e.message, true); }
+  }));
 
   // YouTube's copied transcript puts each timestamp on its own line
   // ("0:00", or "2 seconds" in newer layouts). This drops those lines.
@@ -754,6 +800,17 @@
     $('urlOpen').classList.toggle('hidden', !url);
     if (url) $('urlOpen').href = url;
   });
+  $('urlAuto').addEventListener('click', () => busy($('urlAuto'), 'Capturing…', async () => {
+    const url = normalizeUrl($('urlInput').value);
+    if (!url) { toast('Enter a valid link starting with http:// or https://', true); return; }
+    try {
+      const res = await invokeCapture('capture-url', { url });
+      $('urlInput').value = '';
+      $('urlOpen').classList.add('hidden');
+      toast('Article saved ✓ ' + res.title);
+      loadRecent();
+    } catch (e) { toast('Could not capture: ' + e.message, true); }
+  }));
   $('urlSave').addEventListener('click', () => busy($('urlSave'), 'Saving…', async () => {
     const url = normalizeUrl($('urlInput').value);
     if (!url) { toast('Enter a valid link starting with http:// or https://', true); return; }
