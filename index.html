@@ -459,6 +459,19 @@
     text.textContent = long ? full.slice(0, PREVIEW_CHARS) + '…' : full;
     card.appendChild(text);
 
+    // A search result that matched INSIDE a long capture shows the passage that
+    // matched, since the opening of a transcript is usually not why it matched.
+    if (row.matched_chunk) {
+      const why = el('div', 'text');
+      why.style.marginTop = '8px';
+      why.style.opacity = '0.85';
+      const chunk = row.matched_chunk.length > PREVIEW_CHARS
+        ? row.matched_chunk.slice(0, PREVIEW_CHARS) + '…'
+        : row.matched_chunk;
+      why.textContent = '(from partway through a longer capture)\n' + chunk;
+      card.appendChild(why);
+    }
+
     const meta = el('div', 'meta');
     const time = el('span');
     time.textContent = new Date(row.created_at).toLocaleString();
@@ -838,15 +851,17 @@
     const q = $('searchBox').value.trim();
     if (!q) { clearSearch(); return; }
     $('searchStatus').textContent = 'Searching…';
-    // Treat % and _ as ordinary characters, not wildcards.
-    const pattern = '%' + q.replace(/[\\%_]/g, (m) => '\\' + m) + '%';
-    const { data, error } = await sb.from('thoughts')
-      .select('id, content, created_at')
-      .ilike('content', pattern)
-      .order('created_at', { ascending: false })
-      .limit(50);
-    if (error) { $('searchStatus').textContent = 'Search failed: ' + error.message; return; }
-    $('searchStatus').textContent = data.length + (data.length === 1 ? ' result' : ' results') + (data.length === 50 ? ' (showing the newest 50)' : '');
+    // Hybrid search (meaning + exact words, including inside long captures) runs on
+    // the server, which keeps your embedding key out of the browser.
+    let res;
+    try {
+      res = await invokeCapture('search-brain', { query: q, limit: 20 });
+    } catch (e) {
+      $('searchStatus').textContent = 'Search failed: ' + e.message;
+      return;
+    }
+    const data = res.results || [];
+    $('searchStatus').textContent = data.length + (data.length === 1 ? ' result' : ' results');
     renderThoughts(data, $('searchResults'), 'Nothing matched "' + q + '".');
   }
   function clearSearch() {

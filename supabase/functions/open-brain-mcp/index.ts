@@ -49,9 +49,10 @@ const TOOLS = [
     name: "search_thoughts",
     description:
       "Search the user's personal knowledge base (their 'brain': notes, YouTube transcripts, articles, " +
-      "Telegram messages) by meaning, so related ideas are found even when the words differ. Returns up to " +
-      "10 matches, most similar first, with a similarity score, each followed by the thoughts it is connected " +
-      "to, and long content shortened — call get_thought with an id to read one in full.",
+      "Telegram messages) by meaning AND exact words together, so related ideas are found even when the words " +
+      "differ, and exact names or numbers are found too. Searches inside long captures. Returns up to 10 " +
+      "matches, best first, each followed by the thoughts it is connected to, with long content shortened — " +
+      "call get_thought with an id to read one in full.",
     inputSchema: {
       type: "object",
       properties: {
@@ -227,15 +228,20 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<st
       });
       const { embedding } = embRes.ok ? await embRes.json() : { embedding: null };
 
-      if (embedding) {
+      {
+        // HYBRID: send the words AND the embedding. The database ranks by meaning
+        // and by exact keywords, fuses the two lists, and also checks each
+        // document's chunks. p_user_id is required: this server uses the service
+        // key, which skips row-level security, so it must filter by owner itself.
         const { data: matches, error: rpcError } = await db.rpc("search_thoughts", {
-          query_embedding: embedding,
+          query_text: query,
           p_user_id: ownerUserId,
+          ...(embedding ? { query_embedding: embedding } : {}),
           match_threshold: 0.3,
           match_count: SEARCH_LIMIT,
         });
         if (rpcError) {
-          console.error("semantic search failed, using keyword search", rpcError.message);
+          console.error("hybrid search failed, using plain keyword search", rpcError.message);
         } else if (matches && matches.length) {
           // Pull in what each result is connected to. Never let this break search.
           let linkMap = new Map<string, LinkedThought[]>();
@@ -244,7 +250,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<st
           } catch (err) {
             console.error("could not load linked thoughts", err);
           }
-          return formatSemantic(`Thoughts closest in meaning to "${query}":`, matches, linkMap);
+          return formatSemantic(`Best matches for "${query}" (by meaning and exact words):`, matches, linkMap);
         }
       }
     } catch (err) {
@@ -368,14 +374,25 @@ async function fetchLinked(
 
 function formatSemantic(
   heading: string,
-  rows: { id: string; content: string; created_at: string; similarity: number }[],
+  rows: {
+    id: string;
+    content: string;
+    created_at: string;
+    similarity: number;
+    matched_chunk?: string | null;
+  }[],
   linkMap: Map<string, LinkedThought[]> = new Map(),
 ) {
   const items = rows.map((row, i) => {
-    const content = row.content.length > PREVIEW_CHARS
-      ? row.content.slice(0, PREVIEW_CHARS) + "… [truncated — use get_thought for the full text]"
-      : row.content;
-    const pct = Math.round(row.similarity * 100);
+    // When the match came from INSIDE a long capture, show the passage that
+    // matched, since the opening of a transcript is usually not why it matched.
+    const fromChunk = typeof row.matched_chunk === "string" && row.matched_chunk.length > 0;
+    const source = fromChunk ? (row.matched_chunk as string) : row.content;
+    const body = source.length > PREVIEW_CHARS
+      ? source.slice(0, PREVIEW_CHARS) + "… [truncated — use get_thought for the full text]"
+      : source;
+    const content = fromChunk ? `(from partway through a longer capture)\n   ${body}` : body;
+    const pct = row.similarity > 0 ? `${Math.round(row.similarity * 100)}%` : "keyword match";
     const linked = (linkMap.get(row.id) ?? []).map((l) => {
       const preview = l.content.length > LINKED_PREVIEW_CHARS
         ? l.content.slice(0, LINKED_PREVIEW_CHARS) + "…"
@@ -383,7 +400,7 @@ function formatSemantic(
       return `      ↳ linked (${Math.round(l.similarity * 100)}%) id: ${l.id}\n        ${preview}`;
     });
     const linkedBlock = linked.length ? `\n   Connected to:\n${linked.join("\n")}` : "";
-    return `${i + 1}. id: ${row.id}\n   match: ${pct}%   saved: ${row.created_at}\n   ${content}${linkedBlock}`;
+    return `${i + 1}. id: ${row.id}\n   match: ${pct}   saved: ${row.created_at}\n   ${content}${linkedBlock}`;
   });
   return heading + "\n\n" + items.join("\n\n");
 }

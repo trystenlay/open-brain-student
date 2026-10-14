@@ -11,6 +11,9 @@
 //
 //   3. LINK:   once the thought has an embedding, finds its nearest neighbors
 //      (the thoughts closest in meaning) and saves a link to each.
+//   4. CHUNK:  if the thought is long (over 2,000 characters), cuts it into
+//      overlapping pieces, each with its own embedding, so a detail buried in
+//      the middle can be found. Does nothing for short thoughts.
 //
 // Each job can fail without stopping the others. A thought that fails to embed
 // still saves, and can be backfilled later.
@@ -18,6 +21,9 @@
 // It ALWAYS returns 200. The thought itself is already saved, so enrichment
 // is a bonus, never a gate.
 // ============================================================================
+
+import { createClient } from "@supabase/supabase-js";
+import { saveThoughtChunksSafe } from "../_shared/thought-chunks.ts";
 
 const CATEGORIES = ["idea", "learning", "question", "reference", "plan", "reflection"];
 const MIN_LENGTH = 20; // very short notes aren't worth an AI summary
@@ -45,12 +51,17 @@ Deno.serve(async (req) => {
       console.error("enrich-thought: enrichment crashed", err);
     }
 
-    // Job 2: the embedding. Done for every thought, digests included.
+    // Job 2: the embedding (and the links that follow from it). Done for every
+    // thought, digests included.
     try {
       await embed(thought, serviceKey, supabaseUrl);
     } catch (err) {
       console.error("enrich-thought: embedding crashed", err);
     }
+
+    // Job 4: chunk it, if it is long enough to be worth it. Never throws.
+    const db = createClient(supabaseUrl, serviceKey, { auth: { persistSession: false } });
+    await saveThoughtChunksSafe(db, thought.id, thought.content, "enrich-thought", "summary", thought.user_id);
   } catch (err) {
     console.error("enrich-thought crashed", err);
   }
