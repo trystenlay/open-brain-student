@@ -93,12 +93,12 @@ Deno.serve(async () => {
 
       // Save the digest as a new thought. It is saved as category 'digest', so
       // enrich-thought skips it and it stays out of future digests.
-      const saveRes = await fetch(`${supabaseUrl}/rest/v1/thoughts`, {
+      const saveRes = await fetch(`${supabaseUrl}/rest/v1/thoughts?on_conflict=dedup_key,user_id`, {
         method: "POST",
         headers: {
           ...headers,
           "Content-Type": "application/json",
-          Prefer: "return=minimal",
+          Prefer: "resolution=merge-duplicates,return=minimal",
         },
         body: JSON.stringify({
           user_id: userId,

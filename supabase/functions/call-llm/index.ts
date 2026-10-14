@@ -13,6 +13,7 @@
 // ============================================================================
 
 import { bearerToken, corsHeaders, jsonResponse } from "../_shared/http.ts";
+import { isServiceRoleRequest } from "../_shared/auth.ts";
 
 // Published list prices, in US dollars per million tokens.
 // Check your provider's pricing page if these change.
@@ -29,7 +30,7 @@ Deno.serve(async (req) => {
 
   // Only our own functions may call this. The service-role key is the proof.
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
-  if (!serviceKey || bearerToken(req) !== serviceKey) {
+  if (!serviceKey || !isServiceRoleRequest(req)) {
     return jsonResponse({ error: "Not allowed" }, 401);
   }
 

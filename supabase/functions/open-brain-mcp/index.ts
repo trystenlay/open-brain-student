@@ -12,7 +12,7 @@
 //   3. Only then is the database touched.
 //
 // Tools the AI gets:
-//   search_thoughts  — find thoughts containing some words
+//   search_thoughts  — find thoughts by MEANING (falls back to matching words)
 //   list_recent      — your newest thoughts
 //   get_thought      — one thought, full length
 //   add_thought      — save a new thought
@@ -49,12 +49,13 @@ const TOOLS = [
     name: "search_thoughts",
     description:
       "Search the user's personal knowledge base (their 'brain': notes, YouTube transcripts, articles, " +
-      "Telegram messages) for thoughts containing the given words. Returns up to 10 matches, newest first, " +
-      "with long content shortened — call get_thought with an id to read one in full.",
+      "Telegram messages) by meaning, so related ideas are found even when the words differ. Returns up to " +
+      "10 matches, most similar first, with a similarity score, each followed by the thoughts it is connected " +
+      "to, and long content shortened — call get_thought with an id to read one in full.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Words or phrase to look for, e.g. 'trading' or 'new york open'." },
+        query: { type: "string", description: "What to look for, in your own words, e.g. 'how to get new clients' or 'new york open'." },
       },
       required: ["query"],
     },
@@ -212,7 +213,46 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<st
   if (name === "search_thoughts") {
     const query = typeof args.query === "string" ? args.query.trim() : "";
     if (!query) throw new Error("search_thoughts needs a query, e.g. { \"query\": \"trading\" }");
-    // Treat % and _ as ordinary characters, not wildcards (same as the app).
+    // 1. BY MEANING. Turn the question into an embedding, then ask the database for
+    //    the thoughts whose embeddings sit closest to it. The service key is the
+    //    proof generate-embedding needs that one of our own functions is asking.
+    try {
+      const embRes = await fetch(`${Deno.env.get("SUPABASE_URL")}/functions/v1/generate-embedding`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`,
+        },
+        body: JSON.stringify({ text: query }),
+      });
+      const { embedding } = embRes.ok ? await embRes.json() : { embedding: null };
+
+      if (embedding) {
+        const { data: matches, error: rpcError } = await db.rpc("search_thoughts", {
+          query_embedding: embedding,
+          p_user_id: ownerUserId,
+          match_threshold: 0.3,
+          match_count: SEARCH_LIMIT,
+        });
+        if (rpcError) {
+          console.error("semantic search failed, using keyword search", rpcError.message);
+        } else if (matches && matches.length) {
+          // Pull in what each result is connected to. Never let this break search.
+          let linkMap = new Map<string, LinkedThought[]>();
+          try {
+            linkMap = await fetchLinked(db, ownerUserId, matches.map((m: { id: string }) => m.id));
+          } catch (err) {
+            console.error("could not load linked thoughts", err);
+          }
+          return formatSemantic(`Thoughts closest in meaning to "${query}":`, matches, linkMap);
+        }
+      }
+    } catch (err) {
+      console.error("semantic search unavailable, using keyword search", err);
+    }
+
+    // 2. BY WORDS. The fallback: the original keyword match. Treat % and _ as
+    //    ordinary characters, not wildcards (same as the app).
     const pattern = "%" + query.replace(/[\\%_]/g, (m) => "\\" + m) + "%";
     const { data, error } = await db
       .from("thoughts")
@@ -261,7 +301,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<st
   if (!content) throw new Error("add_thought needs some content to save.");
   const { data, error } = await db
     .from("thoughts")
-    .insert({ content, user_id: ownerUserId, source: "mcp" })
+    .upsert({ content, user_id: ownerUserId, source: "mcp" }, { onConflict: "dedup_key,user_id", ignoreDuplicates: false })
     .select("id, content, created_at")
     .single();
   if (error) throw new Error("Could not save: " + error.message);
@@ -271,6 +311,83 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<st
 // ---------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------
+type LinkedThought = { id: string; content: string; similarity: number };
+const LINKED_PER_RESULT = 3;
+const LINKED_PREVIEW_CHARS = 160;
+
+// For each thought id, the thoughts it is linked to: strongest first, never
+// repeating something that is already a top-level result.
+async function fetchLinked(
+  db: ReturnType<typeof createClient>,
+  ownerUserId: string,
+  ids: string[],
+): Promise<Map<string, LinkedThought[]>> {
+  const out = new Map<string, LinkedThought[]>();
+  if (!ids.length) return out;
+
+  const list = ids.join(",");
+  const { data: links, error } = await db
+    .from("thought_links")
+    .select("source_thought_id, target_thought_id, similarity_score")
+    .eq("user_id", ownerUserId)
+    .or(`source_thought_id.in.(${list}),target_thought_id.in.(${list})`);
+  if (error || !links?.length) return out;
+
+  const inResults = new Set(ids);
+  const pairs: { from: string; to: string; similarity: number }[] = [];
+  for (const l of links) {
+    if (inResults.has(l.source_thought_id) && !inResults.has(l.target_thought_id)) {
+      pairs.push({ from: l.source_thought_id, to: l.target_thought_id, similarity: l.similarity_score });
+    }
+    if (inResults.has(l.target_thought_id) && !inResults.has(l.source_thought_id)) {
+      pairs.push({ from: l.target_thought_id, to: l.source_thought_id, similarity: l.similarity_score });
+    }
+  }
+  if (!pairs.length) return out;
+
+  const neighborIds = [...new Set(pairs.map((p) => p.to))];
+  const { data: neighbors } = await db
+    .from("thoughts")
+    .select("id, content")
+    .eq("user_id", ownerUserId)
+    .in("id", neighborIds);
+  const byId = new Map((neighbors ?? []).map((n: { id: string; content: string }) => [n.id, n.content]));
+
+  pairs.sort((a, b) => b.similarity - a.similarity);
+  for (const p of pairs) {
+    const content = byId.get(p.to);
+    if (!content) continue;
+    const arr = out.get(p.from) ?? [];
+    if (arr.length < LINKED_PER_RESULT && !arr.some((x) => x.id === p.to)) {
+      arr.push({ id: p.to, content, similarity: p.similarity });
+      out.set(p.from, arr);
+    }
+  }
+  return out;
+}
+
+function formatSemantic(
+  heading: string,
+  rows: { id: string; content: string; created_at: string; similarity: number }[],
+  linkMap: Map<string, LinkedThought[]> = new Map(),
+) {
+  const items = rows.map((row, i) => {
+    const content = row.content.length > PREVIEW_CHARS
+      ? row.content.slice(0, PREVIEW_CHARS) + "… [truncated — use get_thought for the full text]"
+      : row.content;
+    const pct = Math.round(row.similarity * 100);
+    const linked = (linkMap.get(row.id) ?? []).map((l) => {
+      const preview = l.content.length > LINKED_PREVIEW_CHARS
+        ? l.content.slice(0, LINKED_PREVIEW_CHARS) + "…"
+        : l.content;
+      return `      ↳ linked (${Math.round(l.similarity * 100)}%) id: ${l.id}\n        ${preview}`;
+    });
+    const linkedBlock = linked.length ? `\n   Connected to:\n${linked.join("\n")}` : "";
+    return `${i + 1}. id: ${row.id}\n   match: ${pct}%   saved: ${row.created_at}\n   ${content}${linkedBlock}`;
+  });
+  return heading + "\n\n" + items.join("\n\n");
+}
+
 function formatList(heading: string, rows: Thought[]) {
   const items = rows.map((row, i) => {
     const content = row.content.length > PREVIEW_CHARS

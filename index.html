@@ -424,7 +424,9 @@
     if (!currentUser) throw new Error('You are not signed in.');
     const row = { content, user_id: currentUser.id };
     if (metadata) row.metadata = metadata;
-    const { data, error } = await sb.from('thoughts').insert(row).select('id').single();
+    const { data, error } = await sb.from('thoughts')
+      .upsert(row, { onConflict: 'dedup_key,user_id', ignoreDuplicates: false })
+      .select('id').single();
     if (error) throw error;
     return data;
   }

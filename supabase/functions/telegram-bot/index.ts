@@ -149,7 +149,10 @@ async function handleUpdate(update: TelegramUpdate) {
   }
 
   // Anything else is a new thought.
-  const { error } = await db.from("thoughts").insert({ content: text, user_id: ownerUserId, source: "telegram" });
+  const { error } = await db.from("thoughts").upsert(
+    { content: text, user_id: ownerUserId, source: "telegram" },
+    { onConflict: "dedup_key,user_id", ignoreDuplicates: false },
+  );
   if (error) {
     console.error("telegram-bot: save failed", error);
     await reply(chatId, "Could not save: " + error.message);

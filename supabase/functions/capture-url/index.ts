@@ -99,12 +99,12 @@ Deno.serve(async (req) => {
     // Same format the app's own URL tab has always used.
     const content = `🔗 URL: ${title}\n${parsed.toString()}\n\n${text}`;
 
-    const { data: thought, error: saveErr } = await admin.from("thoughts").insert({
+    const { data: thought, error: saveErr } = await admin.from("thoughts").upsert({
       user_id: user.id,
       content,
       source: "url",
       metadata: { title, url: parsed.toString() },
-    }).select("id").single();
+    }, { onConflict: "dedup_key,user_id", ignoreDuplicates: false }).select("id").single();
     if (saveErr || !thought) {
       console.error("[url] save failed", saveErr);
       return jsonResponse({ ok: false, error: "Could not save: " + (saveErr?.message ?? "unknown") }, 500);

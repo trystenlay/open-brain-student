@@ -269,7 +269,7 @@ Deno.serve(async (req) => {
     const label = result.hasTranscript ? "" : "(No transcript was available — this is the video description.)\n\n";
     const content = `📹 YouTube: ${title}\n${videoUrl}\n\n${label}${result.content}`;
 
-    const { data: thought, error: saveErr } = await admin.from("thoughts").insert({
+    const { data: thought, error: saveErr } = await admin.from("thoughts").upsert({
       user_id: user.id,
       content,
       source: "youtube",
@@ -280,7 +280,7 @@ Deno.serve(async (req) => {
         has_transcript: result.hasTranscript,
         fetched_via: result.source,
       },
-    }).select("id").single();
+    }, { onConflict: "dedup_key,user_id", ignoreDuplicates: false }).select("id").single();
     if (saveErr || !thought) {
       console.error("[youtube] save failed", saveErr);
       return jsonResponse({ ok: false, error: "Could not save: " + (saveErr?.message ?? "unknown") }, 500);
